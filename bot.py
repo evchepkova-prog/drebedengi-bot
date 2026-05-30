@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 
 import anthropic
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from telegram import Update
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     filters, ContextTypes
@@ -18,7 +18,6 @@ logger = logging.getLogger(__name__)
 
 ANTHROPIC_API_KEY = os.environ['ANTHROPIC_API_KEY']
 TELEGRAM_TOKEN    = os.environ['TELEGRAM_TOKEN']
-
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 RULES_FILE = '/data/rules.json'
@@ -49,6 +48,7 @@ ACCOUNTS = [
     'Revolut', 'Revolut отдельный', 'Мой кошелёк', 'СберБанк', 'Т-Банк',
     'Альфа дебет', 'Сейф домашний', 'СберБанк Под Бизнес',
     'Revolut Физ Лица impact', 'Альфа кредитка', 'Сбербанк тайный',
+    'Ипотека Быково', 'Кредит авто', 'Алексей',
 ]
 
 sessions = {}
@@ -75,14 +75,8 @@ async def parse_images(images, rules):
     cats_str = ', '.join(ALL_CATS)
     prompt = (
         'Ты парсер банковских выписок.\n'
-        'На скриншотах транзакции из банковских приложений.\n'
+        'На скриншотах транзакции из банковских приложений (Revolut, Т-Банк, Сбер, Альфа).\n'
         'Извлеки ВСЕ видимые транзакции.\n\n'
-        'ОПРЕДЕЛЕНИЕ БАНКА по визуальным признакам:\n'
-        '- Revolut: тёмный фон, логотип R, надписи Personal/Отдельный кошелек/Физ лицо impact -> account=Revolut или Revolut отдельный или Revolut Физ Лица impact\n'
-        '- Т-Банк: жёлтый логотип T, надпись T-BANK вверху -> account=Т-Банк\n'
-        '- СберБанк: зелёный логотип, надпись Сбер -> account=СберБанк\n'
-        '- Альфа: красный логотип А -> account=Альфа дебет\n'
-        'Если банк не определён точно — оставь account пустым.\n\n'
         'Для каждой верни JSON объект:\n'
         '- id: порядковый номер\n'
         '- date: YYYY-MM-DD HH:MM:00\n'
@@ -98,8 +92,7 @@ async def parse_images(images, rules):
         '  Apple/Google/Netflix -> Подписки/моб\n'
         '  АЗС/бензин -> Топливо\n'
         '  переводы между кошельками Revolut -> type=transfer\n'
-        '  если не уверен -> Без категории\n'
-        'ВАЖНО: текущий год ' + str(datetime.now().year) + '. Все даты ставь ' + str(datetime.now().year) + '-ХХ-ХХ.\n\n'
+        '  если не уверен -> Без категории\n\n'
         'Верни ТОЛЬКО валидный JSON массив. Без markdown.'
     )
 
@@ -165,12 +158,6 @@ async def parse_images(images, rules):
         tx['transfer_to'] = ''
         transactions.append(tx)
 
-    # Sort by date so exchanges on same day are grouped together
-    transactions.sort(key=lambda t: str(t.get('date', '')))
-    # Re-number after sort
-    for i, tx in enumerate(transactions):
-        tx['id'] = i + 1
-
     return transactions
 
 async def handle_voice_command(text, session):
@@ -195,9 +182,13 @@ async def handle_voice_command(text, session):
         '{"type": "set_category", "id": N, "category": "Название"}\n'
         '{"type": "set_transfer", "id": N, "to_account": "Счёт"}\n'
         '{"type": "set_exchange", "id_out": N, "id_in": M}\n'
+        '{"type": "set_amount", "id": N, "amount": число}\n'
         '{"type": "skip", "id": N}\n'
-        '{"type": "unskip", "id": N}\n\n'
+        '{"type": "unskip", "id": N}\n'
+        '{"type": "add_transaction", "date": "YYYY-MM-DD HH:MM:00", "merchant": "...", "amount": число, "currency": "EUR/USD/руб", "account": "Счёт", "category": "Название", "is_transfer": false, "transfer_to": ""}\n\n'
         'set_exchange - это обмен валюты между своими счетами (две транзакции: расход и приход).\n'
+        'set_amount - изменить сумму существующей транзакции (отрицательное=расход, положительное=приход).\n'
+        'add_transaction - создать новую транзакцию которой нет в списке (например перевод между счетами).\n'
         'Категория должна быть точно из списка.\n'
         'Верни ТОЛЬКО валидный JSON.'
     )
@@ -245,6 +236,30 @@ async def handle_voice_command(text, session):
                 transactions[id_in]['exchange_pair'] = id_out
                 transactions[id_in]['skipped'] = False
 
+        elif t == 'set_amount' and 0 <= idx < len(transactions):
+            transactions[idx]['amount'] = action.get('amount')
+
+        elif t == 'add_transaction':
+            new_tx = {
+                'id': len(transactions) + 1,
+                'date': action.get('date', ''),
+                'merchant': action.get('merchant', ''),
+                'amount': action.get('amount', 0),
+                'currency': action.get('currency', 'EUR'),
+                'account': action.get('account', ''),
+                'category': action.get('category', 'Без категории'),
+                'is_transfer': action.get('is_transfer', False),
+                'transfer_to': action.get('transfer_to', ''),
+                'skipped': False,
+                'is_exchange': False,
+                'exchange_pair': -1,
+                'suspect_transfer': False,
+                'auto': False,
+                'type': 'transfer' if action.get('is_transfer') else 'expense',
+                'suggested_category': action.get('category', 'Без категории'),
+            }
+            transactions.append(new_tx)
+
         elif t == 'skip' and 0 <= idx < len(transactions):
             transactions[idx]['skipped'] = True
 
@@ -265,7 +280,7 @@ def generate_csv(transactions):
         amt = tx.get('amount', 0)
         cur = tx.get('currency', 'EUR')
         date = tx.get('date', '')
-        merchant = str(tx.get('merchant', '')).replace(';', ',').replace('"', "'").replace('->', '-')
+        merchant = str(tx.get('merchant', '')).replace(';', ',').replace('"', "'")
         account = tx.get('account', '') or 'Revolut'
 
         if tx.get('is_exchange'):
@@ -274,35 +289,11 @@ def generate_csv(transactions):
                 tx2 = transactions[pair]
                 done.add(i)
                 done.add(pair)
-                # Determine which is outgoing (negative) and incoming (positive)
-                if tx.get('amount', 0) < 0:
-                    out, inc = tx, tx2
-                else:
-                    out, inc = tx2, tx
-                # Determine accounts from transaction data
-                out_acc = out.get('account', '').strip()
-                inc_acc = inc.get('account', '').strip()
-                # If account not detected, guess from currency
-                # руб accounts: Т-Банк, СберБанк, Альфа дебет, Сбербанк тайный, СберБанк Под Бизнес
-                # EUR accounts: Revolut, Revolut отдельный, Revolut Физ Лица impact
-                rub_accounts = ['Т-Банк', 'СберБанк', 'Альфа дебет', 'Сбербанк тайный', 'СберБанк Под Бизнес']
-                eur_accounts = ['Revolut', 'Revolut отдельный', 'Revolut Физ Лица impact']
-                if not out_acc:
-                    out_acc = 'Т-Банк' if out.get('currency', '') == 'руб' else 'Revolut'
-                if not inc_acc:
-                    inc_acc = 'Revolut' if inc.get('currency', '') in ['EUR', 'USD'] else 'Т-Банк'
-                out_amt = abs(out['amount'])
-                inc_amt = abs(inc['amount'])
-                out_cur = out.get('currency', 'руб')
-                inc_cur = inc.get('currency', 'EUR')
-                comment = str(out.get('merchant', merchant)).replace(';', ',').replace('->', '-')
-                date = str(out.get('date', date))
-                # Step 1: exchange inside source account (2 lines)
-                lines.append('-' + str(out_amt) + ';' + out_cur + ';' + out_acc + ';' + out_acc + ';' + date + ';' + comment + ' обмен')
-                lines.append(str(inc_amt) + ';' + inc_cur + ';' + out_acc + ';' + out_acc + ';' + date + ';' + comment + ' обмен')
-                # Step 2: transfer EUR from source to destination (2 lines)
-                lines.append('-' + str(inc_amt) + ';' + inc_cur + ';' + inc_acc + ';' + out_acc + ';' + date + ';' + comment + ' перевод')
-                lines.append(str(inc_amt) + ';' + inc_cur + ';' + out_acc + ';' + inc_acc + ';' + date + ';' + comment + ' перевод')
+                out = tx if tx['amount'] < 0 else tx2
+                inc = tx2 if tx['amount'] < 0 else tx
+                acc = out.get('account', '') or 'Revolut'
+                lines.append(str(abs(out['amount'])) + ';' + out['currency'] + ';' + acc + ';' + acc + ';' + date + ';' + merchant)
+                lines.append(str(abs(inc['amount'])) + ';' + inc['currency'] + ';' + acc + ';' + acc + ';' + date + ';' + merchant)
             continue
 
         if tx['is_transfer'] and tx.get('transfer_to'):
@@ -349,7 +340,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         '2. Напиши /parse\n'
         '3. Голосом или текстом объясни что исправить\n'
         '4. Напиши /csv чтобы скачать файл\n\n'
-        'Голосовые сообщения принимаю!'
+        'Голосовые: транскрибируй в Telegram (удержи → Транскрибировать) и отправь текстом.'
     )
 
 async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -389,16 +380,11 @@ async def parse_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         session['transactions'] = txs
         session['images'] = []
         await update.message.reply_text(format_list(txs))
-        keyboard = ReplyKeyboardMarkup([
-            [KeyboardButton('📥 Добавить ещё скриншоты')],
-            [KeyboardButton('📄 Сформировать CSV')],
-            [KeyboardButton('🔄 Начать заново')],
-        ], resize_keyboard=True)
         await update.message.reply_text(
-            'Что дальше?\n'
-            '• Голосом или текстом объясни что исправить\n'
-            '• Или выбери действие кнопкой внизу',
-            reply_markup=keyboard
+            'Теперь голосом или текстом объясни что исправить.\n'
+            'Пример: транзакция 3 - это обмен, 25000 рублей равно 275 евро\n\n'
+            '/csv - скачать файл\n'
+            '/reset - начать заново'
         )
     except Exception as e:
         await update.message.reply_text('Ошибка: ' + str(e))
@@ -409,42 +395,16 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not session['transactions']:
         await update.message.reply_text('Сначала отправь скриншоты и напиши /parse')
         return
-    # Try to get Telegram's own transcription first (works with Premium)
-    voice_text = None
-    if update.message.voice and update.message.voice.mime_type:
-        pass
-    # Check if Telegram already transcribed it
-    if hasattr(update.message, 'text') and update.message.text:
-        voice_text = update.message.text
-
-    if not voice_text:
-        await update.message.reply_text(
-            'Голос получила, но не могу расшифровать автоматически.\n\n'
-            'Используй кнопку транскрипции Telegram (долгое нажатие на сообщение -> Транскрибировать), '
-            'скопируй текст и отправь мне.'
-        )
-        return
-
-    await update.message.reply_text('Распознала: ' + voice_text)
-    await process_cmd(update, session, voice_text)
+    await update.message.reply_text(
+        'Голосовые не поддерживаются.\n\n'
+        'Сделай так: удержи сообщение → «Транскрибировать» → скопируй текст → отправь мне.'
+    )
 
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     session = get_session(user_id)
     text = update.message.text
     if text.startswith('/'):
-        return
-    if text == '📄 Сформировать CSV':
-        await csv_cmd(update, ctx)
-        return
-    if text == '🔄 Начать заново':
-        await reset_cmd(update, ctx)
-        return
-    if text == '📥 Добавить ещё скриншоты':
-        await update.message.reply_text(
-            'Отправляй скриншоты, потом напиши /parse',
-            reply_markup=ReplyKeyboardRemove()
-        )
         return
     if not session['transactions']:
         await update.message.reply_text('Сначала отправь скриншоты и напиши /parse')
@@ -457,12 +417,6 @@ async def process_cmd(update, session, text):
         reply = await handle_voice_command(text, session)
         await update.message.reply_text(reply)
         await update.message.reply_text(format_list(session['transactions']))
-        keyboard = ReplyKeyboardMarkup([
-            [KeyboardButton('📥 Добавить ещё скриншоты')],
-            [KeyboardButton('📄 Сформировать CSV')],
-            [KeyboardButton('🔄 Начать заново')],
-        ], resize_keyboard=True)
-        await update.message.reply_text('Что дальше?', reply_markup=keyboard)
     except Exception as e:
         await update.message.reply_text('Ошибка: ' + str(e))
 
@@ -484,8 +438,7 @@ async def csv_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         chat_id=update.effective_chat.id,
         document=open(fname, 'rb'),
         filename='drebedengi_' + datetime.now().strftime('%Y-%m-%d') + '.csv',
-        caption='Загрузи в Дребеденьги -> Меню -> Импорт данных',
-        reply_markup=ReplyKeyboardRemove()
+        caption='Загрузи в Дребеденьги -> Меню -> Импорт данных'
     )
 
 async def reset_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
